@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/request"
 	"io"
 	"log"
 	"net"
@@ -65,6 +67,13 @@ type Data struct {
 	Name       string            `json:"name,omitempty"`
 	RemoteAddr string            `json:"remoteAddr,omitempty"`
 	Environ    map[string]string `json:"environ,omitempty"`
+	JWT        *Jwt              `json:"jwt,omitempty"`
+}
+
+type Jwt struct {
+	Valid   bool                   `json:"valid,omitempty"`
+	Headers map[string]interface{} `json:"headers,omitempty"`
+	Claims  *jwt.MapClaims         `json:"claims,omitempty"`
 }
 
 func main() {
@@ -229,6 +238,18 @@ func whoamiHandler(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintln(w, "IP:", ip)
 	}
 
+	handleJWT(r, func(token *jwt.Token, claims *jwt.MapClaims) {
+		for k, v := range token.Header {
+			b, _ := json.Marshal(v)
+			_, _ = fmt.Fprintln(w, fmt.Sprintf("JWT.Header.%v: %v", k, string(b)))
+		}
+		for k, v := range *claims {
+			b, _ := json.Marshal(v)
+			_, _ = fmt.Fprintln(w, fmt.Sprintf("JWT.Claim.%v: %v", k, string(b)))
+		}
+		_, _ = fmt.Fprintln(w, fmt.Sprintf("JWT.Valid: %v", token.Valid))
+	})
+
 	_, _ = fmt.Fprintln(w, "RemoteAddr:", r.RemoteAddr)
 	if err := r.Write(w); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -266,12 +287,49 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		Name:       name,
 		RemoteAddr: r.RemoteAddr,
 		Environ:    environ,
+		JWT:        nil,
 	}
+
+	handleJWT(r, func(token *jwt.Token, claims *jwt.MapClaims) {
+		data.JWT = &Jwt{
+			Claims:  claims,
+			Valid:   token.Valid,
+			Headers: token.Header,
+		}
+	})
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+}
+
+func handleJWT(r *http.Request, callback func(token *jwt.Token, claims *jwt.MapClaims)) {
+	authorizationHeader := r.Header.Get("Authorization")
+	publicKey := r.Header.Get("X-Validate-With-Certificate")
+	if authorizationHeader != "" {
+		token, err := request.AuthorizationHeaderExtractor.ExtractToken(r)
+		if err != nil {
+			return
+		}
+		parsedToken, err := jwt.Parse(token, func(token *jwt.Token) (interface{}, error) {
+			if publicKey != "" {
+				log.Println("Validate JWT with key : " + publicKey)
+				bs := []byte("-----BEGIN CERTIFICATE-----\n" + publicKey + "\n-----END CERTIFICATE-----")
+				return jwt.ParseRSAPublicKeyFromPEM(bs)
+			} else {
+				log.Println("Not validating JWT Token")
+			}
+			return nil, nil
+		})
+		if parsedToken != nil {
+			if claims, ok := parsedToken.Claims.(jwt.MapClaims); ok {
+				callback(parsedToken, &claims)
+			} else {
+				callback(parsedToken, nil)
+			}
+		}
 	}
 }
 
